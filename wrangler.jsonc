@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "customer-background",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "single-page-application", "run_worker_first": ["/api/*"] },
+  "d1_databases": [{ "binding": "DB", "database_name": "customer-background", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }],
+  "workflows": [{ "name": "customer-background-research", "binding": "RESEARCH", "class_name": "ResearchWorkflow" }],
+  "vars": { "APP_NAME": "客户背调工作台", "DEFAULT_API_URL": "https://once.novai.su", "DEFAULT_MODEL": "[次-流抗截]gemini-3.1-pro-preview", "ALTERNATE_MODEL": "[次]claude-opus-5" },
+  "observability": { "enabled": false }
+}

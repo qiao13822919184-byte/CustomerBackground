@@ -1,0 +1,80 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Activity, BookOpen, Check, ChevronsUpDown, CircleHelp, FolderOpen, LayoutDashboard, LogOut, Menu, Plus, RefreshCw, Settings as SettingsIcon, ShieldCheck, Users, X } from 'lucide-react';
+import type { Advertiser, AuditEvent, Job, Lead, User, Workspace } from '../shared/types';
+import { api, downloadText, errorMessage, post, time } from './api';
+import { Auth, PasswordForm } from './Auth';
+import { Advertisers } from './Advertisers';
+import { Leads } from './Leads';
+import { Settings, Team, roleLabels } from './Admin';
+import { Busy, Empty, Field, Modal, Notice } from './ui';
+
+type Page = 'leads' | 'advertisers' | 'jobs' | 'team' | 'settings';
+const navigation: Array<{id: Page; label: string; icon: typeof Users}> = [{id: 'leads', label: '客户工作台', icon: LayoutDashboard}, {id: 'advertisers', label: '广告主档案', icon: BookOpen}, {id: 'jobs', label: '任务中心', icon: Activity}, {id: 'team', label: '团队协作', icon: Users}, {id: 'settings', label: '模型与系统', icon: SettingsIcon}];
+
+export default function App() {
+  const [user, setUser] = useState<User | null>(null); const [initialized, setInitialized] = useState(true); const [ready, setReady] = useState(false); const [error, setError] = useState('');
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]); const [workspaceId, setWorkspaceId] = useState(''); const [advertisers, setAdvertisers] = useState<Advertiser[]>([]); const [leads, setLeads] = useState<Lead[]>([]); const [members, setMembers] = useState<User[]>([]); const [jobs, setJobs] = useState<Job[]>([]);
+  const [page, setPage] = useState<Page>('leads'); const [selectedLead, setSelectedLead] = useState(''); const [dirty, setDirty] = useState(false); const [revision, setRevision] = useState(0); const [syncState, setSyncState] = useState<'syncing' | 'online' | 'error'>('syncing'); const [lastSynced, setLastSynced] = useState(''); const [passwordOpen, setPasswordOpen] = useState(false); const [newWorkspace, setNewWorkspace] = useState(false); const [workspaceName, setWorkspaceName] = useState(''); const [workspaceBusy, setWorkspaceBusy] = useState(false); const [menuOpen, setMenuOpen] = useState(false);
+  const activeWorkspace = useRef(workspaceId); activeWorkspace.current = workspaceId;
+  const eventsCursor = useRef(''); const refreshing = useRef(false); const authReady = useRef(false);
+  const workspace = workspaces.find(item => item.id === workspaceId); const canEdit = !!user && user.role !== 'viewer';
+  async function loadAuth() { setError(''); setReady(false); try { const status = await api<{initialized: boolean}>('/auth/status'); setInitialized(status.initialized); if (status.initialized) { try { const response = await api<{user: User}>('/auth/me'); setUser(response.user); } catch { setUser(null); } } setReady(true); } catch (exception) { setError(errorMessage(exception)); setReady(true); } }
+  useEffect(() => { void loadAuth(); const expire = () => { setUser(null); setError('登录已过期，请重新登录。'); }; window.addEventListener('session-expired', expire); return () => window.removeEventListener('session-expired', expire); }, []);
+  useEffect(() => {
+    if (!user) { authReady.current = false; setWorkspaces([]); setWorkspaceId(''); return; }
+    if (authReady.current) return; authReady.current = true;
+    api<{workspaces: Workspace[]}>('/workspaces').then(result => { setWorkspaces(result.workspaces); setWorkspaceId(result.workspaces[0]?.id || ''); setError(''); }).catch(exception => setError(errorMessage(exception)));
+  }, [user]);
+  const refresh = useCallback(async () => {
+    const id = activeWorkspace.current; if (!id) return;
+    const results = await Promise.allSettled([api<{advertisers: Advertiser[]}>(`/advertisers?workspace_id=${encodeURIComponent(id)}`), api<{leads: Lead[]}>(`/leads?workspace_id=${encodeURIComponent(id)}`), api<{users: User[]}>(`/workspaces/${id}/members`), api<{jobs: Job[]}>(`/jobs?workspace_id=${encodeURIComponent(id)}`)]);
+    if (activeWorkspace.current !== id) return;
+    const [a, l, m, j] = results;
+    if (a.status === 'fulfilled') setAdvertisers(a.value.advertisers);
+    if (l.status === 'fulfilled') setLeads(l.value.leads);
+    if (m.status === 'fulfilled') setMembers(m.value.users);
+    if (j.status === 'fulfilled') setJobs(j.value.jobs);
+    const failure = results.find(result => result.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
+    setRevision(current => current + 1);
+  }, []);
+  useEffect(() => {
+    if (!workspaceId) return;
+    eventsCursor.current = ''; setAdvertisers([]); setLeads([]); setMembers([]); setJobs([]); setSyncState('syncing');
+    void refresh().then(() => { setSyncState('online'); setLastSynced(new Date().toISOString()); setError(''); }).catch(exception => { setError(errorMessage(exception)); setSyncState('error'); });
+  }, [workspaceId, refresh]);
+  useEffect(() => {
+    if (!workspaceId || !user) return;
+    let active = true;
+    async function poll() {
+      if (document.hidden || refreshing.current) return; refreshing.current = true;
+      try {
+        const id = workspaceId; const results = await Promise.allSettled([api<{events: AuditEvent[]; server_time: string}>(`/events?workspace_id=${encodeURIComponent(id)}&since=${encodeURIComponent(eventsCursor.current)}`), api<{jobs: Job[]}>(`/jobs?workspace_id=${encodeURIComponent(id)}`)]);
+        if (!active || activeWorkspace.current !== id) return;
+        const [eventsResult, jobsResult] = results;
+        if (jobsResult.status === 'fulfilled') setJobs(jobsResult.value.jobs); else throw jobsResult.reason;
+        if (eventsResult.status === 'rejected') throw eventsResult.reason;
+        if (eventsResult.value.events.length || !eventsCursor.current) await refresh();
+        if (!active) return;
+        eventsCursor.current = eventsResult.value.server_time; setSyncState('online'); setLastSynced(eventsResult.value.server_time);
+      } catch { if (active) setSyncState('error'); } finally { refreshing.current = false; }
+    }
+    const timer = setInterval(() => void poll(), 3000); const visible = () => { if (!document.hidden) void poll(); }; document.addEventListener('visibilitychange', visible); void poll();
+    return () => { active = false; clearInterval(timer); document.removeEventListener('visibilitychange', visible); };
+  }, [workspaceId, user?.id, refresh]);
+  function leaveDraft() { if (dirty && !window.confirm('当前有尚未保存的修改。离开将丢弃本页草稿，是否继续？')) return false; setDirty(false); return true; }
+  function navigate(next: Page) { if (!leaveDraft()) return; setPage(next); setSelectedLead(''); setMenuOpen(false); }
+  function chooseLead(id: string) { if (!leaveDraft()) return; setSelectedLead(id); }
+  async function logout() { if (!leaveDraft()) return; try { await post('/auth/logout'); setUser(null); setSelectedLead(''); } catch (exception) { setError(errorMessage(exception)); } }
+  async function createWorkspace() { if (!workspaceName.trim()) return; setWorkspaceBusy(true); setError(''); try { const result = await post<{workspace: Workspace}>('/workspaces', { name: workspaceName.trim() }); setWorkspaces(current => [...current, result.workspace]); setWorkspaceId(result.workspace.id); setNewWorkspace(false); setWorkspaceName(''); setSelectedLead(''); } catch (exception) { setError(errorMessage(exception)); } finally { setWorkspaceBusy(false); } }
+  if (!ready) return <div className="app-loading"><span className="brand-symbol">C<span>↗</span></span><Busy>正在连接团队工作台</Busy></div>;
+  if (!user) return <>{error && <div className="auth-error"><Notice tone="error">{error}<button className="text-button" onClick={() => void loadAuth()}>重新连接</button></Notice></div>}<Auth initialized={initialized} onLogin={value => { setUser(value); setError(''); setInitialized(true); }} /></>;
+  return <div className="app-shell">{menuOpen && <button aria-label="关闭导航" className="sidebar-scrim" onClick={() => setMenuOpen(false)} />}<aside className={`sidebar ${menuOpen ? 'open' : ''}`}><div className="brand"><span className="brand-symbol">C<span>↗</span></span><div>客户背调<small>TEAM WORKSPACE</small></div><button className="mobile-only icon-button" onClick={() => setMenuOpen(false)} aria-label="关闭菜单"><X size={19} /></button></div><div className="workspace-switch"><span className="sidebar-caption">当前工作区</span><div className="workspace-select"><FolderOpen size={18} /><select aria-label="选择工作区" value={workspaceId} onChange={event => { if (leaveDraft()) { setWorkspaceId(event.target.value); setSelectedLead(''); } }}><option value="" disabled>{workspaces.length ? '选择工作区' : '暂无工作区'}</option>{workspaces.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronsUpDown size={14} /></div>{user.role === 'admin' && <button className="new-workspace" onClick={() => { if (leaveDraft()) setNewWorkspace(true); }}><Plus size={13} />新建工作区</button>}</div><nav>{navigation.filter(item => item.id !== 'settings' || user.role === 'admin').map(item => <button key={item.id} className={page === item.id ? 'active' : ''} onClick={() => navigate(item.id)}><item.icon size={19} />{item.label}{item.id === 'jobs' && jobs.filter(job => ['running', 'queued'].includes(job.status)).length > 0 && <span className="nav-badge">{jobs.filter(job => ['running', 'queued'].includes(job.status)).length}</span>}</button>)}</nav><div className="sidebar-bottom"><div className="sidebar-tip"><ShieldCheck size={18} /><p>团队资料，持续沉淀。<br /><small>授权共享 · 自动保存 · 历史可查</small></p></div><button className="user-control" onClick={() => setPasswordOpen(true)}><span className="avatar">{(user.display_name || user.username).slice(0, 1)}</span><span><strong>{user.display_name || user.username}</strong><small>{roleLabels[user.role]} · 修改密码</small></span></button><button className="logout" onClick={() => void logout()}><LogOut size={15} />退出登录</button></div></aside><div className="main-shell"><header className="topbar"><div className="inline"><button className="icon-button mobile-only" aria-label="打开导航" onClick={() => setMenuOpen(true)}><Menu size={21} /></button><span className="breadcrumb">{workspace?.name || '团队工作台'}<span>/</span><strong>{navigation.find(item => item.id === page)?.label}</strong></span></div><div className={`sync-indicator ${syncState}`} title={lastSynced ? `最近同步：${time(lastSynced)}` : '正在连接'}><span className="sync-dot" />{syncState === 'online' ? '团队数据已同步' : syncState === 'syncing' ? '正在同步' : '连接中断，正在重试'}<button className="icon-button" aria-label="立即同步" onClick={() => { setSyncState('syncing'); void refresh().then(() => { setSyncState('online'); setLastSynced(new Date().toISOString()); }).catch(() => setSyncState('error')); }}><RefreshCw size={14} /></button></div></header><main className="main-content">{error && <Notice tone="error">{error}<button className="text-button" onClick={() => setError('')}>关闭提示</button></Notice>}{page === 'settings' && user.role === 'admin' ? <Settings onDirty={setDirty} /> : !workspaceId ? <Empty title={user.role === 'admin' ? '创建团队的第一个工作区' : '等待分配工作区'} text={user.role === 'admin' ? '一个工作区汇集一组广告主、客户和协作成员。' : '请联系管理员，将你的账号加入对应工作区。'}>{user.role === 'admin' && <button className="button primary" onClick={() => setNewWorkspace(true)}><Plus size={16} />创建工作区</button>}</Empty> : <>{page === 'leads' && <Leads leads={leads} advertisers={advertisers} members={members} workspaceId={workspaceId} canEdit={canEdit} onRefresh={refresh} onDirty={setDirty} selectedId={selectedLead} onSelect={chooseLead} detailRevision={revision} />}{page === 'advertisers' && <Advertisers key={workspaceId} advertisers={advertisers} workspaceId={workspaceId} canEdit={canEdit} onRefresh={refresh} onDirty={setDirty} jobs={jobs} />}{page === 'jobs' && <Jobs jobs={jobs} leads={leads} advertisers={advertisers} canEdit={canEdit} onRefresh={refresh} onOpenLead={id => { setSelectedLead(id); setPage('leads'); }} />}{page === 'team' && <Team key={workspaceId} user={user} workspaceId={workspaceId} workspaceName={workspace?.name || ''} members={members} workspaces={workspaces} onRefresh={refresh} onDirty={setDirty} />}</>}</main><footer className="main-footer"><span>客户背调 · 团队工作台</span><span><CircleHelp size={13} />身份匹配、资料可信度与开发必要度分别判断</span></footer></div>{(passwordOpen || !!user.must_change_password) && <Modal title="设置账户密码" onClose={() => { if (!user.must_change_password) setPasswordOpen(false); }}><PasswordForm forced={!!user.must_change_password} onDone={() => { setUser(current => current ? { ...current, must_change_password: 0 } : current); setPasswordOpen(false); }} /></Modal>}{newWorkspace && <Modal title="创建工作区" onClose={() => setNewWorkspace(false)}><form onSubmit={event => { event.preventDefault(); void createWorkspace(); }}><Field label="工作区名称"><input autoFocus value={workspaceName} onChange={event => setWorkspaceName(event.target.value)} placeholder="例如：海外客户开发一组" required /></Field><p className="muted">创建后，可在团队协作中分配成员访问权限。</p><div className="modal-actions"><button className="button" type="button" onClick={() => setNewWorkspace(false)}>取消</button><button className="button primary" disabled={workspaceBusy}>{workspaceBusy ? <Busy /> : '创建工作区'}</button></div></form></Modal>}</div>;
+}
+
+function Jobs({ jobs, leads, advertisers, canEdit, onRefresh, onOpenLead }: {jobs: Job[]; leads: Lead[]; advertisers: Advertiser[]; canEdit: boolean; onRefresh: () => Promise<void>; onOpenLead: (id: string) => void}) {
+  const [error, setError] = useState(''); const [busy, setBusy] = useState(''); const labels: Record<Job['status'], string> = { queued: '排队中', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消' };
+  async function downloadResult(job: Job) { setBusy(job.id); setError(''); try { const response = await fetch(`/api/jobs/${job.id}/result`, { credentials: 'include' }); if (!response.ok) { const body = await response.json() as {error?: string}; throw new Error(body.error || '读取结果失败'); } const text = await response.text(); downloadText(`企业档案_任务${job.id}.md`, text); } catch (exception) { setError(errorMessage(exception)); } finally { setBusy(''); } }
+  async function cancel(job: Job) { setBusy(job.id); setError(''); try { await post(`/jobs/${job.id}/cancel`); await onRefresh(); } catch (exception) { setError(errorMessage(exception)); } finally { setBusy(''); } }
+  return <><div className="page-heading"><div><span className="eyebrow">RESEARCH OPERATIONS</span><h1>任务中心</h1><p>查看团队研究进度。关闭页面后，已提交的后台任务仍会继续运行。</p></div><span className="live-badge"><span className="sync-dot" />每 3 秒同步</span></div>{error && <Notice tone="error">{error}</Notice>}<div className="job-list">{jobs.map(job => { const lead = leads.find(item => item.id === job.lead_id); return <section className="panel job-card" key={job.id}><div className={`job-icon ${job.status}`}>{['running', 'queued'].includes(job.status) ? <RefreshCw size={22} className={job.status === 'running' ? 'spin' : ''} /> : job.status === 'completed' ? <Check size={22} /> : <Activity size={22} />}</div><div className="job-main"><div className="inline"><h3>{job.kind === 'research' ? lead?.company || lead?.name || '客户深度背调' : advertisers.find(item => item.id === job.advertiser_id)?.name || '企业档案分析'}</h3><span className={`status-pill status-${job.status}`}>{labels[job.status]}</span></div><p>{job.error || job.stage || '等待执行'}</p><small>{job.kind === 'research' ? '客户研究' : '广告主建档'} · {job.model || '按当前配置'} · 提交于 {time(job.created_at)}</small></div><div className="job-actions">{job.kind === 'profile' && ['completed', 'failed'].includes(job.status) && <button className="button" disabled={busy === job.id} onClick={() => void downloadResult(job)}>下载生成档案</button>}{job.lead_id && <button className="button" onClick={() => onOpenLead(job.lead_id!)}>查看客户</button>}{canEdit && ['queued', 'running'].includes(job.status) && <button className="text-button danger-text" disabled={busy === job.id} onClick={() => void cancel(job)}>{busy === job.id ? '正在取消…' : '取消任务'}</button>}</div></section>; })}{!jobs.length && <Empty title="暂无研究任务" text="在客户详情启动背调，或上传广告主材料进行分析，进度会在这里显示。" />}</div></>;
+}

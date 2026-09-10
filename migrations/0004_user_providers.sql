@@ -1,0 +1,2 @@
+CREATE TABLE IF NOT EXISTS user_providers(user_id TEXT PRIMARY KEY REFERENCES users(id), mode TEXT NOT NULL CHECK(mode IN ('inherit','dedicated')), api_url TEXT, api_key TEXT, model TEXT, alternate_model TEXT, config_hash TEXT NOT NULL, tested_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS provider_tests(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), config_hash TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL);

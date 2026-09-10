@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS profile_proposals(job_id TEXT PRIMARY KEY REFERENCES jobs(id), advertiser_id TEXT NOT NULL, base_version INTEGER NOT NULL, profile_md TEXT NOT NULL, created_at TEXT NOT NULL);
