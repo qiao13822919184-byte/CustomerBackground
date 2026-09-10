@@ -113,6 +113,16 @@ describe('evidence and outreach gates', () => {
     expect(result.outreach).not.toContain('I saw');
     expect(result.outreach_claim_ids).toEqual([]);
   });
+  it('uses only the declared customization need when identity is unknown, without re-asking the known buyer role', () => {
+    const result = validateResearchOutput(base, [], { ...lead, business_type: 'installation / detailing business', customization: 'both_private_label_and_product_customization' }, advertiser);
+    expect(result.match_level).toBe(1);
+    expect(result.outreach).toContain('customization you requested');
+    expect(result.outreach).not.toContain('business use or resale');
+    expect(result.outreach).not.toContain('I saw');
+    const standard = validateResearchOutput(base, [], { ...lead, business_type: 'installation / detailing business', customization: 'standard_products_without_customization' }, advertiser);
+    expect(standard.outreach).not.toContain('customization you requested');
+    expect(standard.outreach).toContain('product evaluation');
+  });
   it('does not combine a phone at company A and a person at company B into company C', () => {
     const other: Evidence = { ...page, id: 'E2', title: 'Other Company contact', text: 'Other Company. Alex Sample. Software consulting.', url: 'https://other.org/contact' };
     const result = validateResearchOutput({ ...base, identity_links: [base.identity_links[0], { ...base.identity_links[1], entity: 'Other Company', source_ids: ['E2'] }] }, [page, other], lead, advertiser);

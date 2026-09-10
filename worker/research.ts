@@ -144,8 +144,17 @@ export function sellerOutreachIdentity(advertiser: Pick<Advertiser, 'name'> & { 
 
 export function safeFormOutreach(lead: Partial<Lead>, advertiser: Pick<Advertiser, 'name'> & { profile_md?: string }): string {
   const company = sellerOutreachIdentity(advertiser);
-  const product = cleanSentence(lead.product || 'your sourcing plans', 110).replace(/[?!.]+/g, '');
-  return `Hello, I'm with ${company}. I'm following up on your enquiry about ${product}. To help us understand whether our supply options fit your plans, could you confirm whether this is for your business use or resale?`;
+  const product = cleanSentence(lead.product || 'your sourcing plans', 110).replace(/[?!.]+/g, '').replace(/^all three:\s*/i, '');
+  const role = cleanSentence(lead.business_type || '', 200);
+  const customization = cleanSentence(lead.customization || '', 200);
+  const customRequested = /oem|private.?label|customization only|both.*custom|贴牌|定制/i.test(customization) && !/without|not sure|no custom|不需要|无需|不确定/i.test(customization);
+  const question = customRequested
+    ? 'To focus our initial proposal, which specifications or branding details matter most for the customization you requested?'
+    : /starting|筹备|创业/i.test(role) ? 'To focus our initial proposal, which product and business use are you planning to launch first?'
+    : /installation|detailing|安装|施工/i.test(role) ? 'To focus our initial proposal, what application or performance requirement should we prioritize for your product evaluation?'
+    : /distributor|brand|resell|wholesale|经销|品牌|批发/i.test(role) ? 'To focus our initial proposal, what product requirements should we assess for the resale business you mentioned?'
+    : 'To help us assess a suitable supply proposal, could you confirm whether this is for your business use or resale?';
+  return `Hello, I'm with ${company}. I'm following up on your enquiry about ${product}. ${question}`;
 }
 
 /** Deterministic safeguards supplement (and never inflate) the model's judgment. */
