@@ -28,4 +28,4 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/customer-background && git pull --ff-only && docker compose up -d --build'
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/customer-background && git pull --ff-only && docker compose up -d --build --wait --wait-timeout 120'

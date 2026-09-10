@@ -123,6 +123,26 @@ export function extractHtml(html: string, baseUrl: string): { title: string; tex
 export interface SearchSettings { search_provider?: 'bing' | 'brave'; search_api_key?: string; public_fetch?: typeof fetch }
 export interface ToolResult { evidence: Evidence[]; data: Record<string, unknown> }
 
+export function assessSearchRelevance(query: string, result: { title: string; url: string; description: string }): { level: 'identifier_hit' | 'candidate' | 'weak_or_unrelated'; reason: string } {
+  const text = decodeEntities(`${result.title} ${result.url} ${result.description}`).toLowerCase();
+  const normalized = text.replace(/[^\p{L}\p{N}@.]/gu, '');
+  const q = query.toLowerCase();
+  const emails = q.match(/[a-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/g) || [];
+  const phones = [...q.matchAll(/(?:\+|\b)\d[\d\s().-]{6,}\d\b/g)].map(m => m[0].replace(/\D/g, ''));
+  const domains = (q.match(/(?:[a-z0-9-]+\.)+[a-z]{2,}/g) || []).filter(domain => !emails.some(email => email.endsWith('@' + domain)));
+  if (emails.some(email => text.includes(email)) || phones.some(phone => normalized.includes(phone))) return { level: 'identifier_hit', reason: '摘要含本次查询的完整联系方式；仍须读取原页核实归属。' };
+  if (domains.some(domain => text.includes(domain))) return { level: 'candidate', reason: '摘要或URL含查询域名，尚未连接联系人。' };
+  const companyMailDomains = emails.map(email => email.split('@')[1]).filter(domain => !['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'aol.com', 'qq.com', '163.com'].includes(domain));
+  if (companyMailDomains.some(domain => text.includes(domain))) return { level: 'candidate', reason: '结果含非公共邮箱的企业域名，可作为网站候选；未出现完整邮箱，不构成身份绑定。' };
+  const quoted = [...q.matchAll(/["“]([^"”]+)["”]/g)].map(m => m[1].trim()).filter(value => /\s/.test(value) && !/[\d@]/.test(value));
+  if (quoted.some(phrase => text.includes(phrase))) return { level: 'candidate', reason: '出现完整检索短语，只是候选，不能据此认定身份。' };
+  if (emails.length || phones.length || domains.length) return { level: 'weak_or_unrelated', reason: '未出现查询的完整邮箱、号码或域名；搜索可能自动改词或忽略限定，不可归给客户。' };
+  const words = [...new Set(q.replace(/\b(?:site|filetype):\S+/g, '').match(/[\p{L}\p{N}]{3,}/gu) || [])].filter(word => !['and', 'the', 'www', 'com', 'org', 'site'].includes(word));
+  const hits = words.filter(word => text.includes(word)).length;
+  const needed = words.length <= 1 ? 1 : Math.max(2, Math.ceil(words.length / 2));
+  return hits >= needed && words.length ? { level: 'candidate', reason: `出现${hits}/${words.length}个实质检索词，仍需消歧。` } : { level: 'weak_or_unrelated', reason: `只出现${hits}/${words.length}个实质检索词；可能是通用词、词典或其他同名结果。` };
+}
+
 export async function searchWeb(query: string, settings: SearchSettings, nextId: () => string): Promise<ToolResult> {
   const q = query.trim().slice(0, 400);
   if (!q) throw new Error('搜索词不能为空');
@@ -145,14 +165,19 @@ export async function searchWeb(query: string, settings: SearchSettings, nextId:
       const tag = (item: string, name: string) => decodeEntities((item.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)<\\/${name}>`, 'i'))?.[1] || '').replace(/^<!\[CDATA\[|\]\]>$/g, '')).trim();
       for (const item of text.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) results.push({ title: tag(item[1], 'title'), url: tag(item[1], 'link'), description: tag(item[1], 'description') });
     }
+    const relevance: { evidence_id: string; level: string; reason: string }[] = [];
     for (const result of results.slice(0, 6)) {
       try {
         const url = assertPublicUrl(result.url).href;
-        evidence.push({ id: nextId(), url, title: decodeEntities(result.title).slice(0, 250), text: decodeEntities(result.description).replace(/<[^>]*>/g, ' ').slice(0, 1600), fetched_at: now, kind: 'search', status: '搜索摘要，未等同原页核验', query: q });
+        const assessment = assessSearchRelevance(q, result);
+        const id = nextId();
+        evidence.push({ id, url, title: decodeEntities(result.title).slice(0, 250), text: decodeEntities(result.description).replace(/<[^>]*>/g, ' ').slice(0, 1600), fetched_at: now, kind: 'search', status: assessment.level === 'weak_or_unrelated' ? '低相关检索摘要，不支持客户归属' : '搜索摘要，未等同原页核验', query: q });
+        relevance.push({ evidence_id: id, ...assessment });
       } catch { /* Reject unsafe result URLs. */ }
     }
-    const audit = { id: nextId(), url: searchUrl, title: `${provider} 搜索记录`, text: evidence.length ? `返回 ${evidence.length} 个可读取链接候选；未打开原页。` : '本次未返回可用结果；不证明客户不存在。', fetched_at: now, kind: 'search' as const, status: '检索执行记录', query: q };
-    return { evidence: [...evidence, audit], data: { query: q, provider, results: evidence, audit, warning: '搜索摘要可截断、过时或误匹配。关键身份结论须打开原页；同名同城不能建立归属。' } };
+    const relevantCount = relevance.filter(item => item.level !== 'weak_or_unrelated').length;
+    const audit = { id: nextId(), url: searchUrl, title: `${provider} 搜索记录`, text: evidence.length ? `返回 ${evidence.length} 条摘要，其中${relevantCount}条通过词面相关性筛选；未打开原页。${!relevantCount ? '本次搜索未提供相关候选，可能忽略了查询限定。' : ''}` : '本次未返回可用结果；不证明客户不存在。', fetched_at: now, kind: 'search' as const, status: '检索执行记录', query: q };
+    return { evidence: [...evidence, audit], data: { query: q, provider, results: evidence.filter(e => !e.status.startsWith('低相关')), low_relevance_results: evidence.filter(e => e.status.startsWith('低相关')).map(e => ({ evidence_id: e.id, url: e.url, title: e.title })), relevance, relevant_count: relevantCount, audit, warning: !relevantCount ? '本查询没有相关结果，禁止将通用词、词典、Drive等自动改词结果认作客户。请沿其他标识或来源；不同查询重复返回相同无关结果时停止该路线。' : '词面相关性不证明身份。搜索摘要可截断、过时或误匹配；关键结论须打开原页，不能合并同名企业。' } };
   } catch (error) {
     const failed: Evidence = { id: nextId(), url: searchUrl, title: '搜索失败', text: safeError(error), fetched_at: now, kind: 'search', status: '失败', query: q };
     return { evidence: [failed], data: { query: q, provider, error: failed.text, evidence_id: failed.id, results: [] } };

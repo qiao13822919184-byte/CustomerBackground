@@ -67,14 +67,14 @@ export function parseCompletion(raw: string, contentType = ''): Completion {
   return { content, tool_calls, usage, finish_reason: finishReason };
 }
 
-async function complete(settings: PrivateProviderSettings, messages: Message[], options: { tools?: JsonObject[]; max_tokens?: number; model?: string } = {}): Promise<Completion> {
+async function complete(settings: PrivateProviderSettings, messages: Message[], options: { tools?: JsonObject[]; max_tokens?: number; model?: string; no_tools?: boolean } = {}): Promise<Completion> {
   if (!settings.api_key) throw new Error('管理员尚未配置模型API密钥');
   const endpoint = providerEndpoint(settings.api_url);
   if (!settings.public_fetch) await verifyPublicHost(new URL(endpoint));
   const response = await (settings.public_fetch || fetch)(endpoint, {
     method: 'POST', redirect: 'error', signal: AbortSignal.timeout(110_000),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.api_key}` },
-    body: JSON.stringify({ model: options.model || settings.model, messages, stream: true, max_tokens: options.max_tokens || 6500, ...(options.tools?.length ? { tools: options.tools, tool_choice: 'auto' } : {}) }),
+    body: JSON.stringify({ model: options.model || settings.model, messages, stream: true, max_tokens: options.max_tokens || 6500, ...(options.no_tools ? { tool_choice: 'none' } : options.tools?.length ? { tools: options.tools, tool_choice: 'auto' } : {}) }),
   });
   if (!response.ok) {
     // Do not echo provider payloads: upstream errors can contain prompts or credentials.
@@ -128,16 +128,30 @@ function evidenceHasContact(evidence: Evidence, kind: string, value: string, cou
 
 function cleanSentence(value: string, max: number): string { return value.replace(/[\r\n\t]/g, ' ').replace(/\\([_@])/g, '$1').replace(/_/g, ' ').replace(/[<>`]/g, '').replace(/\s+/g, ' ').trim().slice(0, max); }
 
-export function safeFormOutreach(lead: Partial<Lead>, advertiser: Pick<Advertiser, 'name'>): string {
-  const company = cleanSentence(advertiser.name || '[your company]', 90);
+export function sellerOutreachIdentity(advertiser: Pick<Advertiser, 'name'> & { profile_md?: string }): string {
+  const profile = advertiser.profile_md || '';
+  const direct = cleanSentence(advertiser.name, 100);
+  const valid = (value: string) => /^[A-Za-z0-9][A-Za-z0-9 '&.,()/-]{1,110}$/.test(value) && !/https?:|www\.|ignore|instruction|api.?key|system.?prompt/i.test(value);
+  if (valid(direct)) return direct;
+  for (const match of profile.matchAll(/^\s*(?:[-*]\s*)?(?:\|\s*)?(?:英文(?:名称|名|公司名|主体)|English(?:\s+(?:company|legal))?\s+name|company_name_en|seller_entity_en_working|outreach_identity_en|outreach_name|对外英文名称)\s*(?:\||[:：])\s*([^|\n]+)/gmi)) {
+    const candidate = match[1].replace(/^["'`*\s]+|["'`*\s]+$/g, '').trim();
+    if (valid(candidate)) return candidate;
+  }
+  // Never invent a transliteration or legal English name. A known local company name
+  // is still identified explicitly, with a natural sales-team description around it.
+  return direct ? `the sales team at ${direct}` : 'the supplier team handling your enquiry';
+}
+
+export function safeFormOutreach(lead: Partial<Lead>, advertiser: Pick<Advertiser, 'name'> & { profile_md?: string }): string {
+  const company = sellerOutreachIdentity(advertiser);
   const product = cleanSentence(lead.product || 'your sourcing plans', 110).replace(/[?!.]+/g, '');
   return `Hello, I'm with ${company}. I'm following up on your enquiry about ${product}. To help us understand whether our supply options fit your plans, could you confirm whether this is for your business use or resale?`;
 }
 
 /** Deterministic safeguards supplement (and never inflate) the model's judgment. */
-export function validateResearchOutput(input: JsonObject, evidence: Evidence[], lead: Partial<Lead>, advertiser: Pick<Advertiser, 'name'>): JsonObject {
+export function validateResearchOutput(input: JsonObject, evidence: Evidence[], lead: Partial<Lead>, advertiser: Pick<Advertiser, 'name'> & { profile_md?: string }): JsonObject {
   const byId = new Map(evidence.map(e => [e.id, e]));
-  const usable = (id: string) => { const e = byId.get(id); return !!e && !/失败|受限|检索执行记录/.test(e.status); };
+  const usable = (id: string) => { const e = byId.get(id); return !!e && !/失败|受限|检索执行记录|低相关/.test(e.status); };
   const sourceIds = (value: unknown) => strings(value, 80).filter(usable);
   const warnings: string[] = [];
   const entity = object(input.entity);
@@ -175,7 +189,7 @@ export function validateResearchOutput(input: JsonObject, evidence: Evidence[], 
   const priority = stop ? 1 : Math.max(1, Math.min(5, Math.round(Number(input.priority) || 2)));
   let outreach = string(input.outreach, 2200).trim();
   const hasOneQuestion = (outreach.match(/\?/g) || []).length === 1;
-  const sellerKnown = normalizeContact(outreach).includes(normalizeContact(cleanSentence(advertiser.name, 90)));
+  const sellerKnown = [cleanSentence(advertiser.name, 90), sellerOutreachIdentity(advertiser)].filter(Boolean).some(name => normalizeContact(outreach).includes(normalizeContact(name)));
   const rejectOutreach = matchLevel === 1 || !hasOneQuestion || !sellerKnown || !outreachIds.length || outreachIds.some(id => !accepted.has(id));
   if (stop) outreach = '';
   else if (rejectOutreach) { outreach = safeFormOutreach(lead, advertiser); warnings.push(matchLevel === 1 ? '匹配1级已强制使用仅含客户自填需求的开场，不引用外部候选。' : '开场事实准入或格式检查未通过，已退回仅使用自填需求的版本。'); }
@@ -206,7 +220,13 @@ export function validateResearchOutput(input: JsonObject, evidence: Evidence[], 
 }
 
 function evidenceForModel(evidence: Evidence[]): JsonObject[] {
-  return evidence.map(e => ({ ...e, text: e.text.slice(0, e.kind === 'page' ? 13_000 : 1700) }));
+  return evidence.filter(e => !/低相关/.test(e.status)).map(e => ({ ...e, text: e.text.slice(0, e.kind === 'page' ? 13_000 : 1700) }));
+}
+
+export function parseResearchResult(content: string): JsonObject {
+  const result = parseJsonOutput(content);
+  if (!Number.isInteger(result.match_level) || Number(result.match_level) < 1 || Number(result.match_level) > 3 || !Number.isInteger(result.priority) || Number(result.priority) < 1 || Number(result.priority) > 5 || !['直接匹配', '条件匹配', '不匹配', '信息不足'].includes(string(result.fit)) || string(result.summary).trim().length < 8) throw new Error('最终JSON缺少有效结论、身份等级、开发等级或适配字段');
+  return result;
 }
 
 function fallbackResult(lead: Lead, reason: string): JsonObject {
@@ -224,9 +244,12 @@ export async function researchLead(_env: Env, lead: Lead, advertiser: Advertiser
   const maxSteps = Math.max(2, Math.min(10, settings.max_steps || 6));
   const maxTools = Math.min(30, maxSteps * 3 + 4);
   const seen = new Map<string, JsonObject>();
+  const usefulEvidence = new Set<string>(), resultFingerprints = new Set<string>();
+  let progressVersion = 0, unproductiveRounds = 0;
+  let stopReason = '';
   const executed: string[] = [], failures: string[] = [];
   const runTool = async (name: string, args: JsonObject): Promise<JsonObject> => {
-    const key = `${name}:${JSON.stringify(args)}`;
+    const key = name === 'search_web' ? `${name}:${string(args.query, 400).normalize('NFKC').toLowerCase().replace(/["“”]/g, '').replace(/\s+/g, ' ').trim()}` : `${name}:${JSON.stringify(args)}`;
     if (seen.has(key)) return { ...seen.get(key)!, duplicate: true, note: '同一调用已执行，请沿不同有效标识或停止。' };
     if (toolCount >= maxTools) return { error: '本任务工具预算已用完，未执行此请求。请在研究边界说明。' };
     toolCount++;
@@ -245,7 +268,16 @@ export async function researchLead(_env: Env, lead: Lead, advertiser: Advertiser
       } else return { error: '未知工具；仅允许 search_web/read_page' };
       evidence.push(...result.evidence);
       for (const e of result.evidence.filter(e => /失败|受限/.test(e.status))) failures.push(`${e.title} ${e.url}：${e.text.slice(0, 180)}`);
-      const safeData = { ...result.data, ...(typeof result.data.text === 'string' ? { text: result.data.text.slice(0, 13_000) } : {}) };
+      const fingerprint = name === 'search_web' ? result.evidence.filter(e => e.kind === 'search' && e.status !== '检索执行记录').map(e => e.url).filter(Boolean).sort().join('|') : '';
+      const repeatedResults = !!fingerprint && resultFingerprints.has(fingerprint);
+      if (fingerprint) resultFingerprints.add(fingerprint);
+      let newRelevant = 0;
+      for (const e of result.evidence.filter(e => e.kind === 'page' && e.status === '已读取公开页面' || e.kind === 'search' && e.status === '搜索摘要，未等同原页核验')) {
+        const signature = `${e.url}|${e.text.slice(0, 700)}`;
+        if (!usefulEvidence.has(signature)) { usefulEvidence.add(signature); newRelevant++; progressVersion++; }
+      }
+      const safeData = { ...result.data, ...(typeof result.data.text === 'string' ? { text: result.data.text.slice(0, 13_000) } : {}), new_relevant_evidence: newRelevant, repeated_result_set: repeatedResults,
+        ...(repeatedResults ? { stopping_hint: '该查询再次返回相同链接集合，未形成新路线。不要更换几个通用词重复搜索；改用真正不同标识/原页，或在最终报告说明受限。' } : {}) };
       seen.set(key, safeData);
       return safeData;
     } catch (error) { const message = safeError(error); failures.push(message); return { error: message }; }
@@ -268,14 +300,17 @@ export async function researchLead(_env: Env, lead: Lead, advertiser: Advertiser
   ];
   let result: JsonObject | null = null;
   let lastError = '';
-  for (let step = 0; step < maxSteps; step++) {
-    await onProgress(`推理与候选消歧（${step + 1}/${maxSteps}轮）`);
+  // Reserve one model request for an isolated, explicitly tool-disabled synthesis.
+  // Omitting tool schemas from an old tool conversation is not sufficient for some gateways.
+  for (let step = 0; step < maxSteps - 1; step++) {
+    await onProgress(`推理与候选消歧（${step + 1}/${maxSteps - 1}轮，另保留最终归纳）`);
     try {
       modelCalls++;
-      const response = await complete(settings, messages, { tools: step < maxSteps - 1 ? tools : undefined });
+      const response = await complete(settings, messages, { tools });
       addUsage(usage, response.usage);
       messages.push({ role: 'assistant', content: response.content || null, ...(response.tool_calls.length ? { tool_calls: response.tool_calls } : {}) });
-      if (response.tool_calls.length && step < maxSteps - 1) {
+      if (response.tool_calls.length) {
+        const before = progressVersion;
         for (const call of response.tool_calls.slice(0, 4)) {
           let data: JsonObject;
           try { data = await runTool(call.function.name, parseJsonOutput(call.function.arguments)); } catch (error) { data = { error: safeError(error) }; }
@@ -283,23 +318,44 @@ export async function researchLead(_env: Env, lead: Lead, advertiser: Advertiser
         }
         // Every requested call needs a response, including excess calls the engine refuses.
         for (const call of response.tool_calls.slice(4)) messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: '单轮最多执行4个工具；此调用未执行。' }) });
+        unproductiveRounds = progressVersion === before ? unproductiveRounds + 1 : 0;
+        if (unproductiveRounds >= 2) { stopReason = '连续两轮未得到新的相关证据，停止重复/无关检索并归纳现有证据；仍有未完成路线，不代表全网穷尽。'; break; }
+        if (toolCount >= maxTools) { stopReason = '公开工具预算已达到上限，保留剩余模型请求用于最终归纳。'; break; }
+        messages.push({ role: 'user', content: `本轮新增有价值证据：${progressVersion - before}条。连续无增量${unproductiveRounds}轮；剩余工具${maxTools - toolCount}次。低相关结果不可归给客户，重复相同结果不能充当独立来源。` });
         continue;
       }
-      if (response.tool_calls.length) { lastError = '达到最后推理轮但模型仍申请工具，未执行额外调用。'; break; }
-      try { result = parseJsonOutput(response.content); break; }
+      try { result = parseResearchResult(response.content); break; }
       catch (error) { lastError = safeError(error); messages.push({ role: 'user', content: '上次结果不是完整JSON。仅依据已执行的证据输出完整JSON，不添加新的外部事实。' }); }
     } catch (error) {
       lastError = safeError(error);
-      // A provider may reject tool schemas. One tool-free synthesis uses real seed evidence.
-      if (step === 0 && maxSteps > 1) { messages.push({ role: 'user', content: `本模型工具循环请求失败：${lastError}。只根据已有真实证据输出结果，覆盖明确为有限检索。` });
-        try { modelCalls++; const response = await complete(settings, messages); addUsage(usage, response.usage); result = parseJsonOutput(response.content); failures.push('模型工具调用未完成，使用已执行入口的有限证据综合。'); } catch (fallbackError) { lastError = safeError(fallbackError); }
-      }
+      stopReason = `工具推理循环中断：${lastError}。转入已有证据的有限归纳。`;
       break;
     }
   }
+  let finalSynthesis = false;
+  if (!result) {
+    stopReason ||= '达到本轮自适应检索预算，使用已读取证据进行最终归纳，未执行的路线继续标注未完成。';
+    await onProgress('已结束公开检索，关闭工具并归纳真实证据');
+    const finalMessages: Message[] = [
+      { role: 'system', content: `${RESEARCH_SYSTEM}\n\n当前阶段是最终归纳，所有检索工具已经关闭。不得调用或申请任何工具，不要输出检索计划或工具调用JSON。只依据下方真实证据，按要求输出一个完整报告JSON。未查到或不可读均写未知；不得编造完整研究成功。\n\n${RESULT_INSTRUCTIONS}` },
+      { role: 'user', content: JSON.stringify({ phase: 'final_synthesis_tools_disabled', reason_for_stopping: stopReason, prior_model_warning: lastError || null, advertiser: { name: advertiser.name, allowed_outreach_identity: sellerOutreachIdentity(advertiser), profile_version: advertiser.version, profile_md: advertiser.profile_md.slice(0, 90_000) }, lead,
+        actual_evidence: evidenceForModel(evidence.filter(e => e.id !== 'A0' && e.id !== 'F0')), low_relevance_results_excluded: evidence.filter(e => /低相关/.test(e.status)).length, executed_routes: executed, access_failures: failures, research_time: new Date().toISOString() }) },
+    ];
+    try {
+      modelCalls++;
+      const final = await complete(settings, finalMessages, { no_tools: true });
+      addUsage(usage, final.usage);
+      if (final.tool_calls.length) throw new Error('中转模型在已明确关闭工具的最终阶段仍返回工具申请；未执行这些调用');
+      if (['length', 'max_tokens'].includes(final.finish_reason)) throw new Error('最终归纳被模型输出上限截断');
+      result = parseResearchResult(final.content);
+      finalSynthesis = true;
+      lastError = '';
+    } catch (error) { lastError = `最终归纳失败：${safeError(error)}`; }
+  }
   const clean = validateResearchOutput(result || fallbackResult(lead, lastError || '模型预算耗尽'), evidence, lead, advertiser);
-  clean.coverage = { ...object(clean.coverage), executed, access_failures: failures, ...(lastError ? { synthesis_warning: lastError } : {}), model_calls: modelCalls, tool_calls: toolCount, limit: maxTools, dynamic_maps: '当前自动工具仅支持实际返回的公开文本；动态地图详情、图片和PDF视觉内容未自动浏览。', completed_at: new Date().toISOString() };
-  clean.research_status = !result ? '有限检索/综合失败' : evidence.some(e => e.kind === 'page' && e.status === '已读取公开页面') ? '已完成本次有界公开研究，见覆盖范围' : '有限检索/缺少可读原页';
+  clean.coverage = { ...object(clean.coverage), executed, access_failures: failures, ...(lastError ? { synthesis_warning: lastError } : {}), stop_reason: stopReason || '模型基于已有证据完成归纳', final_synthesis_tools_disabled: finalSynthesis, no_progress_rounds: unproductiveRounds, low_relevance_results: evidence.filter(e => /低相关/.test(e.status)).length, model_calls: modelCalls, tool_calls: toolCount, limit: maxTools, dynamic_maps: '当前自动工具仅支持实际返回的公开文本；动态地图详情、图片和PDF视觉内容未自动浏览。', completed_at: new Date().toISOString() };
+  clean.synthesis_ok = !!result;
+  clean.research_status = !result ? '综合失败' : !stopReason && evidence.some(e => e.kind === 'page' && e.status === '已读取公开页面') ? '有界公开研究' : '有限研究';
   await onProgress('检查证据归属、评分门槛与话术事实准入');
   return { content_md: renderReport(clean, evidence, lead, advertiser), result_json: clean, evidence, usage };
 }

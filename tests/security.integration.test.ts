@@ -43,7 +43,7 @@ beforeEach(async () => {
   await db.prepare('INSERT INTO advertisers VALUES(?,?,?,?,?,?,?)').bind('a1', 'w1', 'Synthetic Supplier', '# Synthetic supplier profile', 1, date, date).run();
   await db.prepare("INSERT INTO user_providers(user_id,mode,config_hash,tested_at,updated_at) VALUES(?,'inherit',?,?,?)").bind('member',await providerFingerprint(await getProvider(env),'inherit'),date,date).run();
   research.previewImport.mockResolvedValue({ leads: [{ name: 'Synthetic Contact', raw: {} }], warnings: [], usage: { input_tokens: 10, output_tokens: 10 } });
-  research.researchLead.mockResolvedValue({ content_md: 'Synthetic report', result_json: { match_level: 3, priority: 4, industry: 'Synthetic industry', fit: '直接匹配' }, evidence: [], usage: { input_tokens: 10, output_tokens: 10 } });
+  research.researchLead.mockResolvedValue({ content_md: 'Synthetic report', result_json: { synthesis_ok: true, research_status: '有界公开研究', match_level: 3, priority: 4, industry: 'Synthetic industry', fit: '直接匹配' }, evidence: [], usage: { input_tokens: 10, output_tokens: 10 } });
   research.testProvider.mockResolvedValue({ ok: true, tool_calling: true, analysis_ok: true, model: 'synthetic-model', message: 'Synthetic test transport passed', usage: { input_tokens: 10, output_tokens: 10 } });
 });
 afterEach(() => { vi.useRealTimers(); db.db.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -99,7 +99,7 @@ describe('cost, concurrency and persistence boundaries', () => {
     await seedLead(); await seedJob();
     research.researchLead.mockImplementationOnce(async () => {
       await db.prepare("UPDATE advertisers SET version=2,profile_md='Changed supplier scope' WHERE id='a1'").run();
-      return { content_md: 'Synthetic historical result', result_json: { match_level: 3, priority: 4, industry: 'Synthetic industry', fit: '直接匹配' }, evidence: [], usage: { input_tokens: 10, output_tokens: 10 } };
+      return { content_md: 'Synthetic historical result', result_json: { synthesis_ok: true, research_status: '有界公开研究', match_level: 3, priority: 4, industry: 'Synthetic industry', fit: '直接匹配' }, evidence: [], usage: { input_tokens: 10, output_tokens: 10 } };
     });
     await runJob(env, 'j1');
     const lead = await db.prepare('SELECT match_level,version FROM leads WHERE id=?').bind('l1').first<{ match_level: number | null; version: number }>();
@@ -155,6 +155,60 @@ describe('cost, concurrency and persistence boundaries', () => {
     await runJob(env, 'j1');
     expect((await db.prepare('SELECT status FROM jobs WHERE id=?').bind('j1').first<{ status: string }>())?.status).toBe('cancelled');
     expect((await db.prepare('SELECT COUNT(*) AS n FROM reports').first<{ n: number }>())?.n).toBe(0);
+  });
+  it.each([false, undefined])('preserves existing customer conclusions when synthesis is unsuccessful (%s)', async synthesisOk => {
+    await seedLead();
+    await db.prepare("UPDATE leads SET match_level=3,priority=5,industry='Previously reviewed industry',fit='直接匹配' WHERE id='l1'").run();
+    await seedJob();
+    research.researchLead.mockResolvedValueOnce({ content_md: 'Synthetic limited evidence for manual review', result_json: { ...(synthesisOk===undefined?{}:{synthesis_ok:synthesisOk}), research_status:'综合失败', match_level:1,priority:2,industry:'未知',fit:'信息不足',coverage:{synthesis_warning:'Synthetic upstream failure'} }, evidence:[],usage:{input_tokens:17,output_tokens:23} });
+    await runJob(env,'j1');
+    const job=await db.prepare("SELECT status,stage,input_tokens,output_tokens FROM jobs WHERE id='j1'").first<{status:string;stage:string;input_tokens:number;output_tokens:number}>();
+    expect(job?.status).toBe('failed');expect(job?.stage).toContain('综合未完成');
+    expect(job?.input_tokens).toBe(17);expect(job?.output_tokens).toBe(23);
+    const lead=await db.prepare("SELECT match_level,priority,industry,fit,version FROM leads WHERE id='l1'").first();
+    expect(lead).toEqual({match_level:3,priority:5,industry:'Previously reviewed industry',fit:'直接匹配',version:1});
+    const report=await db.prepare("SELECT content_md,result_json FROM reports WHERE job_id='j1'").first<{content_md:string;result_json:string}>();
+    expect(report?.content_md).toContain('manual review');expect(JSON.parse(report!.result_json).synthesis_ok).toBe(false);
+    expect((await db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE action='背调任务完成'").first<{n:number}>())?.n).toBe(0);
+    await runJob(env,'j1');
+    expect(research.researchLead).toHaveBeenCalledTimes(1);
+    expect((await db.prepare("SELECT COUNT(*) AS n FROM reports WHERE job_id='j1'").first<{n:number}>())?.n).toBe(1);
+  });
+  it('saves guarded conclusions from successful synthesis while labeling limited public research', async () => {
+    await seedLead();await seedJob();
+    research.researchLead.mockResolvedValueOnce({content_md:'Synthetic self-report and limited research',result_json:{synthesis_ok:true,research_status:'有限研究',match_level:1,priority:3,industry:'未知',fit:'条件匹配',coverage:{not_completed:['No readable relevant original page']}},evidence:[],usage:{input_tokens:11,output_tokens:12}});
+    await runJob(env,'j1');
+    const job=await db.prepare("SELECT status,stage,error FROM jobs WHERE id='j1'").first<{status:string;stage:string;error:string|null}>();
+    expect(job?.status).toBe('completed');expect(job?.stage).toContain('有限研究');expect(job?.error).toBeNull();
+    expect(await db.prepare("SELECT match_level,priority,fit,version FROM leads WHERE id='l1'").first()).toEqual({match_level:1,priority:3,fit:'条件匹配',version:2});
+  });
+});
+
+describe('profile generation compare-and-swap history',()=>{
+  async function profileJob(){
+    const advertiser=await db.prepare("SELECT * FROM advertisers WHERE id='a1'").first();
+    await db.prepare("INSERT INTO jobs(id,workspace_id,advertiser_id,user_id,kind,status,stage,model,profile_version,created_at,updated_at) VALUES('jp','w1','a1','member','profile','queued','queued','synthetic-model',1,?,?)").bind(date,date).run();
+    await db.prepare('INSERT INTO job_payloads VALUES(?,?,?)').bind('jp',0,JSON.stringify({advertiser,materials:[]})).run();
+  }
+  it('does not attribute an intervening same-millisecond profile version to the failed generator',async()=>{
+    vi.useFakeTimers({toFake:['Date']});vi.setSystemTime(new Date('2026-09-11T00:00:00.000Z'));
+    await profileJob();
+    research.buildProfile.mockImplementationOnce(async()=>{
+      await db.prepare("UPDATE advertisers SET profile_md='Intervening externally imported revision',version=2,updated_at=? WHERE id='a1'").bind(new Date().toISOString()).run();
+      return {profile_md:'Generated proposal that must not overwrite the intervening revision',usage:{input_tokens:10,output_tokens:20}};
+    });
+    await runJob(env,'jp');
+    expect((await db.prepare("SELECT status FROM jobs WHERE id='jp'").first<{status:string}>())?.status).toBe('failed');
+    expect((await db.prepare("SELECT COUNT(*) AS n FROM advertiser_versions WHERE advertiser_id='a1' AND user_id='member'").first<{n:number}>())?.n).toBe(0);
+    expect((await db.prepare("SELECT profile_md FROM advertisers WHERE id='a1'").first<{profile_md:string}>())?.profile_md).toBe('Intervening externally imported revision');
+    expect((await db.prepare("SELECT COUNT(*) AS n FROM profile_proposals WHERE job_id='jp'").first<{n:number}>())?.n).toBe(1);
+  });
+  it('records the generated profile version after its successful compare-and-swap',async()=>{
+    await profileJob();
+    research.buildProfile.mockResolvedValueOnce({profile_md:'Synthetic generated profile',usage:{input_tokens:10,output_tokens:20}});
+    await runJob(env,'jp');
+    expect((await db.prepare("SELECT status FROM jobs WHERE id='jp'").first<{status:string}>())?.status).toBe('completed');
+    expect(await db.prepare("SELECT version,profile_md,user_id FROM advertiser_versions WHERE advertiser_id='a1'").first()).toEqual({version:2,profile_md:'Synthetic generated profile',user_id:'member'});
   });
 });
 
