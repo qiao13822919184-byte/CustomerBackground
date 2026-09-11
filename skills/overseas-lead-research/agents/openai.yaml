@@ -1,0 +1,4 @@
+interface:
+  display_name: "海外 B2B 客户背调"
+  short_description: "复用广告主档案，核验海外客户身份、业务适配、开发优先级与建联话术"
+  default_prompt: "请用 $overseas-lead-research，根据我提供的广告主资料或档案与客户表单，完成有来源的背调、匹配分级和建联草稿，并保存可复用 MD 档案。"
