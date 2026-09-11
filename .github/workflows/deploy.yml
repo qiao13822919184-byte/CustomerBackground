@@ -23,9 +23,9 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-      - name: Pull and start application
+      - name: Pull, start HTTPS stack, and verify public endpoint
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/customer-background && git pull --ff-only && docker compose up -d --build --wait --wait-timeout 120'
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" 'cd /opt/customer-background && git pull --ff-only && sh deploy/production.sh'

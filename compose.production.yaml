@@ -1,0 +1,33 @@
+# Add this file after compose.yaml for the public HTTPS deployment.
+# APP_DOMAIN is a bare public hostname; Compose fails before startup if it is empty.
+services:
+  app:
+    environment:
+      APP_ORIGIN: "https://${APP_DOMAIN:?Set APP_DOMAIN to your real public hostname in .env}"
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    environment:
+      # Do not add env_file here: the reverse proxy does not need API credentials.
+      APP_DOMAIN: "${APP_DOMAIN:?Set APP_DOMAIN to your real public hostname in .env}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/caddy:/etc/caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    stop_grace_period: 30s
+volumes:
+  caddy_data:
+  caddy_config:
